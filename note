@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+
+import argparse
+import sqlite3
+import sys
+import os
+import tempfile
+import subprocess
+import re
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo, available_timezones
+import time
+
+
+class NoteLogger:
+    def __init__(self):
+        self.db_path = Path.home() / '.note_log.db'
+        self.conn = None
+        self.init_database()
+
+    def init_database(self):
+        """Initialize SQLite database and create table if not exists"""
+        try:
+            # Ensure parent directory exists
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+            self.conn = sqlite3.connect(self.db_path)
+            cursor = self.conn.cursor()
+
+            # Enable foreign key constraints (disabled by default in SQLite)
+            cursor.execute('PRAGMA foreign_keys = ON')
+
+            # Create notes table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS notes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    note TEXT NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    timezone_name TEXT NOT NULL,
+                    location TEXT
+                )
+            ''')
+
+            # Create tags table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL
+                )
+            ''')
+
+            # Create note_tags junction table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS note_tags (
+                    note_id INTEGER NOT NULL,
+                    tag_id INTEGER NOT NULL,
+                    PRIMARY KEY (note_id, tag_id),
+                    FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE,
+                    FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+                )
+            ''')
+
+            self.conn.commit()
+        except sqlite3.Error as e:
+            print(f"Database error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    def get_system_timezone(self):
+        """Get system IANA timezone name, fallback to UTC"""
+        try:
+            # Try to get from /etc/localtime symlink (Unix systems)
+            if os.path.exists('/etc/localtime'):
+                localtime_path = os.path.realpath('/etc/localtime')
+                if '/zoneinfo/' in localtime_path:
+                    tz_name = localtime_path.split('/zoneinfo/')[-1]
+                    if tz_name in available_timezones():
+                        return tz_name
+
+            # Fallback: try to infer from local time
+            local_tz = datetime.now().astimezone().tzinfo
+            if hasattr(local_tz, 'key'):
+                return local_tz.key
+
+            # Last resort: use UTC
+            return 'UTC'
+        except Exception:
+            return 'UTC'
+
+    def extract_tags(self, text):
+        """Extract hashtags from text, return list of lowercase unique tags"""
+        # Find all hashtags using regex (# followed by word characters)
+        tags = re.findall(r'#(\w+)', text)
+        # Convert to lowercase and remove duplicates while preserving order
+        seen = set()
+        unique_tags = []
+        for tag in tags:
+            tag_lower = tag.lower()
+            if tag_lower not in seen:
+                seen.add(tag_lower)
+                unique_tags.append(tag_lower)
+        return unique_tags
+
+    def save_note_with_tags(self, note_text, timestamp_str, timezone_name):
+        """Save note and extract/link tags"""
+        cursor = self.conn.cursor()
+
+        # Insert the note
+        cursor.execute(
+            'INSERT INTO notes (note, location, timestamp, timezone_name) VALUES (?, ?, ?, ?)',
+            (note_text, None, timestamp_str, timezone_name)
+        )
+        note_id = cursor.lastrowid
+
+        # Extract tags from note text
+        tags = self.extract_tags(note_text)
+
+        # For each tag, insert into tags table (if not exists) and link to note
+        for tag_name in tags:
+            # Insert tag or get existing tag id
+            cursor.execute('INSERT OR IGNORE INTO tags (name) VALUES (?)', (tag_name,))
+            cursor.execute('SELECT id FROM tags WHERE name = ?', (tag_name,))
+            tag_id = cursor.fetchone()[0]
+
+            # Link tag to note
+            cursor.execute('INSERT INTO note_tags (note_id, tag_id) VALUES (?, ?)', (note_id, tag_id))
+
+        self.conn.commit()
+        return note_id
+
+    def add_note_quick(self, text):
+        """Add note from command line arguments"""
+        # Join and trim
+        note_text = ' '.join(text).strip()
+
+        if not note_text:
+            print("Note is empty, not saved.")
+            return
+
+        # Get current timestamp and timezone
+        now = datetime.now()
+        timestamp_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        timezone_name = self.get_system_timezone()
+
+        # Save note with tags
+        note_id = self.save_note_with_tags(note_text, timestamp_str, timezone_name)
+
+        print(f"Note added with ID: {note_id}")
+
+    def add_note_interactive(self):
+        """Add note using text editor"""
+        # Get editor from environment or default to vim
+        editor = os.environ.get('EDITOR', 'vim')
+
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False) as tf:
+            temp_path = tf.name
+
+        try:
+            # Open editor
+            subprocess.run([editor, temp_path], check=True)
+
+            # Read content
+            with open(temp_path, 'r') as f:
+                note_text = f.read().strip()
+
+            if not note_text:
+                print("Note is empty, not saved.")
+                return
+
+            # Get current timestamp and timezone
+            now = datetime.now()
+            timestamp_str = now.strftime('%Y-%m-%d %H:%M:%S')
+            timezone_name = self.get_system_timezone()
+
+            # Save note with tags
+            self.save_note_with_tags(note_text, timestamp_str, timezone_name)
+
+            print("Note saved.")
+        except subprocess.CalledProcessError as e:
+            print(f"Editor error: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+        finally:
+            # Clean up temp file
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+
+    def format_timestamp(self, timestamp_str, timezone_name):
+        """Format timestamp with timezone awareness"""
+        try:
+            current_tz_name = self.get_system_timezone()
+
+            # Parse the stored timezone
+            try:
+                stored_tz = ZoneInfo(timezone_name)
+            except Exception:
+                stored_tz = ZoneInfo('UTC')
+
+            # Parse timestamp as naive datetime
+            dt_naive = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+
+            # Attach timezone
+            dt_aware = dt_naive.replace(tzinfo=stored_tz)
+
+            # Format the datetime
+            formatted_time = dt_aware.strftime('%b %-d, %-I:%M%p').lower()
+            # Fix the AM/PM formatting (remove leading zeros from hour)
+            parts = formatted_time.split(', ')
+            if len(parts) == 2:
+                date_part = parts[0]
+                time_part = parts[1]
+                # Remove leading zero from hour if present
+                if time_part[0] == '0':
+                    time_part = time_part[1:]
+                formatted_time = f"{date_part}, {time_part}"
+
+            # Check if we need to show timezone abbreviation
+            if timezone_name != current_tz_name:
+                # Get timezone abbreviation
+                dt_str = str(dt_aware)
+                # Extract abbreviation (last token when split by space)
+                parts = dt_str.split()
+                if len(parts) >= 3:
+                    tz_abbrev = parts[-1]
+                    return f"[{formatted_time} {tz_abbrev}]"
+
+            return f"[{formatted_time}]"
+
+        except Exception as e:
+            return "[Invalid timestamp]"
+
+    def get_note_tags(self, note_id):
+        """Get all tags for a note"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT t.name FROM tags t
+            INNER JOIN note_tags nt ON t.id = nt.tag_id
+            WHERE nt.note_id = ?
+            ORDER BY t.name
+        ''', (note_id,))
+        return [row[0] for row in cursor.fetchall()]
+
+    def format_note_display(self, note_id, timestamp_str, timezone_name, note_text, truncate=True, show_tags=True):
+        """Format note for display with proper multi-line indentation and truncation"""
+        timestamp_display = self.format_timestamp(timestamp_str, timezone_name)
+
+        # Get tags if needed
+        tags_str = ""
+        if show_tags:
+            tags = self.get_note_tags(note_id)
+            if tags:
+                tags_str = f" [{', '.join(['#' + tag for tag in tags])}]"
+
+        lines = note_text.split('\n')
+
+        # Truncate if more than 4 lines
+        if truncate and len(lines) > 4:
+            # Calculate indent
+            indent_length = len(timestamp_display) + 1  # +1 for the space
+            indent = ' ' * indent_length
+
+            # Print first line with tags
+            print(f"{timestamp_display} {lines[0]}{tags_str}")
+
+            # Print next 3 lines with indent
+            for line in lines[1:4]:
+                print(f"{indent}{line}")
+
+            # Print truncation message with note ID
+            print(f"{indent}... (truncated, note id: {note_id})")
+        elif len(lines) == 1:
+            print(f"{timestamp_display} {lines[0]}{tags_str}")
+        else:
+            # Calculate indent
+            indent_length = len(timestamp_display) + 1  # +1 for the space
+            indent = ' ' * indent_length
+
+            # Print first line with tags
+            print(f"{timestamp_display} {lines[0]}{tags_str}")
+
+            # Print subsequent lines with indent
+            for line in lines[1:]:
+                print(f"{indent}{line}")
+
+    def query_last_n(self, count):
+        """Query last N notes"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT id, note, timestamp, timezone_name, location FROM notes ORDER BY timestamp DESC LIMIT ?',
+            (count,)
+        )
+        rows = cursor.fetchall()
+
+        if not rows:
+            print("No notes found.")
+            return
+
+        for row in rows:
+            note_id, note, timestamp, timezone_name, _ = row
+            self.format_note_display(note_id, timestamp, timezone_name, note)
+
+    def query_all(self):
+        """Query all notes"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT id, note, timestamp, timezone_name, location FROM notes ORDER BY timestamp DESC'
+        )
+        rows = cursor.fetchall()
+
+        if not rows:
+            print("No notes found.")
+            return
+
+        for row in rows:
+            note_id, note, timestamp, timezone_name, _ = row
+            self.format_note_display(note_id, timestamp, timezone_name, note)
+
+    def query_by_date(self, date_str):
+        """Query notes from a specific date"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT id, note, timestamp, timezone_name, location FROM notes WHERE DATE(timestamp) BETWEEN ? AND ? ORDER BY timestamp DESC',
+            (date_str, date_str)
+        )
+        rows = cursor.fetchall()
+
+        if not rows:
+            print(f"No notes found for {date_str}.")
+            return
+
+        for row in rows:
+            note_id, note, timestamp, timezone_name, _ = row
+            self.format_note_display(note_id, timestamp, timezone_name, note)
+
+    def query_date_range(self, from_date, to_date):
+        """Query notes by date range"""
+        cursor = self.conn.cursor()
+
+        if from_date and to_date:
+            cursor.execute(
+                'SELECT id, note, timestamp, timezone_name, location FROM notes WHERE DATE(timestamp) BETWEEN ? AND ? ORDER BY timestamp DESC',
+                (from_date, to_date)
+            )
+        elif from_date:
+            cursor.execute(
+                'SELECT id, note, timestamp, timezone_name, location FROM notes WHERE DATE(timestamp) >= ? ORDER BY timestamp DESC',
+                (from_date,)
+            )
+        elif to_date:
+            cursor.execute(
+                'SELECT id, note, timestamp, timezone_name, location FROM notes WHERE DATE(timestamp) <= ? ORDER BY timestamp DESC',
+                (to_date,)
+            )
+
+        rows = cursor.fetchall()
+
+        if not rows:
+            print("No notes found in the specified date range.")
+            return
+
+        for row in rows:
+            note_id, note, timestamp, timezone_name, _ = row
+            self.format_note_display(note_id, timestamp, timezone_name, note)
+
+    def query_by_tags(self, tag_names, match_all=False):
+        """Query notes by tags (OR or AND logic)"""
+        cursor = self.conn.cursor()
+
+        # Convert tag names to lowercase
+        tag_names_lower = [tag.lower() for tag in tag_names]
+
+        if match_all:
+            # AND logic: note must have ALL tags
+            # Build query to find notes that have all specified tags
+            placeholders = ','.join(['?' for _ in tag_names_lower])
+            query = f'''
+                SELECT DISTINCT n.id, n.note, n.timestamp, n.timezone_name, n.location
+                FROM notes n
+                INNER JOIN note_tags nt ON n.id = nt.note_id
+                INNER JOIN tags t ON nt.tag_id = t.id
+                WHERE t.name IN ({placeholders})
+                GROUP BY n.id
+                HAVING COUNT(DISTINCT t.id) = ?
+                ORDER BY n.timestamp DESC
+            '''
+            cursor.execute(query, tag_names_lower + [len(tag_names_lower)])
+        else:
+            # OR logic: note can have ANY of the tags
+            placeholders = ','.join(['?' for _ in tag_names_lower])
+            query = f'''
+                SELECT DISTINCT n.id, n.note, n.timestamp, n.timezone_name, n.location
+                FROM notes n
+                INNER JOIN note_tags nt ON n.id = nt.note_id
+                INNER JOIN tags t ON nt.tag_id = t.id
+                WHERE t.name IN ({placeholders})
+                ORDER BY n.timestamp DESC
+            '''
+            cursor.execute(query, tag_names_lower)
+
+        rows = cursor.fetchall()
+
+        if not rows:
+            tags_str = ', '.join([f'#{tag}' for tag in tag_names])
+            logic_str = 'all' if match_all else 'any'
+            print(f"No notes found with {logic_str} of these tags: {tags_str}")
+            return
+
+        for row in rows:
+            note_id, note, timestamp, timezone_name, _ = row
+            self.format_note_display(note_id, timestamp, timezone_name, note)
+
+    def show_note_by_id(self, note_id):
+        """Show a specific note by ID without truncation"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT id, note, timestamp, timezone_name, location FROM notes WHERE id = ?',
+            (note_id,)
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            print(f"No note found with ID: {note_id}")
+            return
+
+        note_id, note, timestamp, timezone_name, _ = row
+        self.format_note_display(note_id, timestamp, timezone_name, note, truncate=False)
+
+    def delete_notes(self, count):
+        """Delete last N notes"""
+        cursor = self.conn.cursor()
+
+        # Get IDs of last N notes
+        cursor.execute(
+            'SELECT id FROM notes ORDER BY timestamp DESC LIMIT ?',
+            (count,)
+        )
+        ids = cursor.fetchall()
+
+        if not ids:
+            print("No notes to delete.")
+            return
+
+        # Delete each note
+        deleted_count = 0
+        for (note_id,) in ids:
+            cursor.execute('DELETE FROM notes WHERE id = ?', (note_id,))
+            deleted_count += 1
+
+        self.conn.commit()
+
+        if deleted_count == 1:
+            print("Deleted 1 note.")
+        else:
+            print(f"Deleted {deleted_count} notes.")
+
+    def cleanup_orphaned_tags(self):
+        """Remove tags that have no associated notes and orphaned note_tags entries"""
+        cursor = self.conn.cursor()
+
+        # First, clean up note_tags entries that reference non-existent notes
+        cursor.execute('''
+            DELETE FROM note_tags
+            WHERE note_id NOT IN (SELECT id FROM notes)
+        ''')
+        orphaned_note_tags = cursor.rowcount
+
+        # Then find and delete tags with no associated notes
+        cursor.execute('''
+            SELECT t.id FROM tags t
+            LEFT JOIN note_tags nt ON t.id = nt.tag_id
+            WHERE nt.note_id IS NULL
+        ''')
+        orphaned_ids = cursor.fetchall()
+
+        # Delete orphaned tags
+        deleted_count = 0
+        for (tag_id,) in orphaned_ids:
+            cursor.execute('DELETE FROM tags WHERE id = ?', (tag_id,))
+            deleted_count += 1
+
+        self.conn.commit()
+        return deleted_count
+
+    def list_all_tags(self):
+        """List all tags with note counts, after cleaning up orphaned tags"""
+        # First cleanup orphaned tags
+        orphaned_count = self.cleanup_orphaned_tags()
+
+        cursor = self.conn.cursor()
+
+        # Get all tags with their note counts
+        cursor.execute('''
+            SELECT t.name, COUNT(nt.note_id) as note_count
+            FROM tags t
+            LEFT JOIN note_tags nt ON t.id = nt.tag_id
+            GROUP BY t.id, t.name
+            HAVING note_count > 0
+            ORDER BY t.name
+        ''')
+        tags = cursor.fetchall()
+
+        if not tags:
+            print("No tags found.")
+        else:
+            print("Available tags:")
+            for tag_name, note_count in tags:
+                note_word = "note" if note_count == 1 else "notes"
+                print(f"  #{tag_name} ({note_count} {note_word})")
+
+        if orphaned_count > 0:
+            print(f"\nCleaned up {orphaned_count} orphaned tag{'s' if orphaned_count != 1 else ''}.")
+
+    def close(self):
+        """Close database connection"""
+        if self.conn:
+            self.conn.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='A command-line tool for logging timestamped notes',
+        prog='note'
+    )
+
+    # Query flags
+    parser.add_argument('-n', '--last', type=int, metavar='N', help='Show last N notes')
+    parser.add_argument('-a', '--all', action='store_true', help='Show all notes')
+    parser.add_argument('-d', '--date', type=str, metavar='YYYY-MM-DD', help='Show notes from specific date')
+    parser.add_argument('-f', '--from', dest='from_date', type=str, metavar='YYYY-MM-DD', help='Show notes from date onwards')
+    parser.add_argument('-t', '--to', dest='to_date', type=str, metavar='YYYY-MM-DD', help='Show notes up to date')
+
+    # Tag query flags
+    parser.add_argument('-T', '--tags', nargs='+', metavar='TAG', help='Show notes with any of these tags (OR logic)')
+    parser.add_argument('--tags-all', nargs='+', metavar='TAG', help='Show notes with all of these tags (AND logic)')
+    parser.add_argument('--list-tags', '--lt', action='store_true', help='List all available tags and clean up orphaned tags')
+
+    # Delete flag
+    parser.add_argument('-D', '--delete', type=int, metavar='N', help='Delete last N notes')
+
+    # Show full note by ID
+    parser.add_argument('-i', '--id', type=int, metavar='ID', help='Show full note by ID')
+
+    # Positional arguments for note text (after all flags to avoid conflicts)
+    parser.add_argument('text', nargs='*', help='Note content')
+
+    args = parser.parse_args()
+
+    # Initialize note logger
+    note_logger = NoteLogger()
+
+    try:
+        # Handle delete operation
+        if args.delete:
+            note_logger.delete_notes(args.delete)
+        # Handle list tags
+        elif args.list_tags:
+            note_logger.list_all_tags()
+        # Handle query operations
+        elif args.last:
+            note_logger.query_last_n(args.last)
+        elif args.all:
+            note_logger.query_all()
+        elif args.date:
+            note_logger.query_by_date(args.date)
+        elif args.from_date or args.to_date:
+            note_logger.query_date_range(args.from_date, args.to_date)
+        # Handle tag queries
+        elif args.tags:
+            note_logger.query_by_tags(args.tags, match_all=False)
+        elif args.tags_all:
+            note_logger.query_by_tags(args.tags_all, match_all=True)
+        # Handle show note by ID
+        elif args.id:
+            note_logger.show_note_by_id(args.id)
+        # Handle interactive mode or quick note creation
+        elif not args.text:
+            note_logger.add_note_interactive()
+        # Handle quick note creation
+        elif args.text:
+            note_logger.add_note_quick(args.text)
+        else:
+            parser.print_help()
+    finally:
+        note_logger.close()
+
+
+if __name__ == '__main__':
+    main()
