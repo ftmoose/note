@@ -128,6 +128,31 @@ class NoteLogger:
         self.conn.commit()
         return note_id
 
+    def prompt_for_tags(self, note_text):
+        """Prompt user for tags if none exist in note text"""
+        existing_tags = self.extract_tags(note_text)
+
+        if existing_tags:
+            return note_text
+
+        # Prompt for tags
+        try:
+            tags_input = input("Add tags (space-delimited, without #): ").strip()
+
+            if tags_input:
+                # Parse space-delimited tags
+                tag_words = tags_input.split()
+                # Format as hashtags
+                tag_line = ' '.join([f'#{tag}' for tag in tag_words])
+                # Add tags on new line
+                return f"{note_text}\n{tag_line}"
+            else:
+                return note_text
+        except (EOFError, KeyboardInterrupt):
+            # Handle Ctrl+C or Ctrl+D gracefully
+            print()
+            return note_text
+
     def add_note_quick(self, text):
         """Add note from command line arguments"""
         # Join and trim
@@ -136,6 +161,9 @@ class NoteLogger:
         if not note_text:
             print("Note is empty, not saved.")
             return
+
+        # Prompt for tags if none exist
+        note_text = self.prompt_for_tags(note_text)
 
         # Get current timestamp and timezone
         now = datetime.now()
@@ -167,6 +195,9 @@ class NoteLogger:
             if not note_text:
                 print("Note is empty, not saved.")
                 return
+
+            # Prompt for tags if none exist
+            note_text = self.prompt_for_tags(note_text)
 
             # Get current timestamp and timezone
             now = datetime.now()
